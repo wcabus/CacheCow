@@ -13,117 +13,82 @@ using CacheCow.Common;
 
 namespace CacheCow.Client
 {
-	/// <summary>
-	/// Default implementation of IHttpMessageSerializer using proprietry format
-	/// Does not close the stream since the stream can be used to store other objects
-	/// so it has to be closed in the client
-	/// </summary>
-	public class MessageContentHttpMessageSerializer : IHttpMessageSerializerAsync
-	{
-		private bool _bufferContent;
+    /// <summary>
+    /// Default implementation of IHttpMessageSerializer using proprietry format
+    /// Does not close the stream since the stream can be used to store other objects
+    /// so it has to be closed in the client
+    /// </summary>
+    public class MessageContentHttpMessageSerializer : IHttpMessageSerializerAsync
+    {
+        private bool _bufferContent;
 
-		public MessageContentHttpMessageSerializer()
-			: this(false)
-		{
+        public MessageContentHttpMessageSerializer()
+            : this(true)
+        {
 
-		}
+        }
 
-		public MessageContentHttpMessageSerializer(bool bufferContent)
-		{
-			_bufferContent = bufferContent;
-		}
+        public MessageContentHttpMessageSerializer(bool bufferContent)
+        {
+            _bufferContent = bufferContent;
+        }
 
-		public Task SerializeAsync(Task<HttpResponseMessage> response, Stream stream)
-		{
-			return response.Then(r =>
-			{
-				if (r.Content != null)
-				{
-					TraceWriter.WriteLine("SerializeAsync - before load",
-						TraceLevel.Verbose);
+        public async Task SerializeAsync(HttpResponseMessage response, Stream stream)
+        {
+            if (response.Content != null)
+            {
+                TraceWriter.WriteLine("SerializeAsync - before load",
+                    TraceLevel.Verbose);
+                if(_bufferContent)
+                    await response.Content.LoadIntoBufferAsync().ConfigureAwait(false);
+                TraceWriter.WriteLine("SerializeAsync - after load", TraceLevel.Verbose);               
+            }
+            else
+            {
+                TraceWriter.WriteLine("Content NULL - before load",
+                    TraceLevel.Verbose);
+            }
 
-					return r.Content.LoadIntoBufferAsync()
-						.Then(() =>
-						{
-							TraceWriter.WriteLine("SerializeAsync - after load", TraceLevel.Verbose);
-							var httpMessageContent = new HttpMessageContent(r);
-							// All in-memory and CPU-bound so no need to async
-							return httpMessageContent.ReadAsByteArrayAsync();
-						})
-						.Then( buffer =>
-							        {
-										TraceWriter.WriteLine("SerializeAsync - after ReadAsByteArrayAsync", TraceLevel.Verbose);
-										return Task.Factory.FromAsync(stream.BeginWrite, stream.EndWrite,
-											buffer, 0, buffer.Length, null, TaskCreationOptions.AttachedToParent);						                                                		
-							        }
-								);
+            var httpMessageContent = new HttpMessageContent(response);
+            var buffer = await httpMessageContent.ReadAsByteArrayAsync();
+            TraceWriter.WriteLine("SerializeAsync - after ReadAsByteArrayAsync", TraceLevel.Verbose);
+            stream.Write(buffer, 0, buffer.Length);
+        }
 
-						;
-				}
-				else
-				{
-					TraceWriter.WriteLine("Content NULL - before load",
-						TraceLevel.Verbose);
+        public async Task SerializeAsync(HttpRequestMessage request, Stream stream)
+        {
+            if (request.Content != null && _bufferContent)
+            {
+                await request.Content.LoadIntoBufferAsync().ConfigureAwait(false);
+            }
 
-					var httpMessageContent = new HttpMessageContent(r);
-					// All in-memory and CPU-bound so no need to async
-					var buffer = httpMessageContent.ReadAsByteArrayAsync().Result;
-					return Task.Factory.FromAsync(stream.BeginWrite, stream.EndWrite,
-						buffer, 0, buffer.Length, null, TaskCreationOptions.AttachedToParent);
-				}
-			}
-				);
-		}
+            var httpMessageContent = new HttpMessageContent(request);
+            var buffer = await httpMessageContent.ReadAsByteArrayAsync().ConfigureAwait(false);
+            stream.Write(buffer, 0, buffer.Length);            
+        }
 
-		public Task SerializeAsync(HttpRequestMessage request, Stream stream)
-		{
-			if (request.Content != null)
-			{
-				return request.Content.LoadIntoBufferAsync()
-					.Then(() =>
-					{
-						var httpMessageContent = new HttpMessageContent(request);
-						// All in-memory and CPU-bound so no need to async
-						httpMessageContent.ReadAsByteArrayAsync().Then(
-							buffer =>
-								{
-									return Task.Factory.FromAsync(stream.BeginWrite, stream.EndWrite,
-										buffer, 0, buffer.Length, null, TaskCreationOptions.AttachedToParent);
-								});
-					});
-			}
-			else
-			{
-				var httpMessageContent = new HttpMessageContent(request);
-				// All in-memory and CPU-bound so no need to async
-				return httpMessageContent.ReadAsByteArrayAsync().Then(
-					buffer =>
-						{
-							return Task.Factory.FromAsync(stream.BeginWrite, stream.EndWrite,
-							      buffer, 0, buffer.Length, null, TaskCreationOptions.AttachedToParent);
-						}
-					);
+        public async Task<HttpResponseMessage> DeserializeToResponseAsync(Stream stream)
+        {
+            var response = new HttpResponseMessage();
+            response.Content = new StreamContent(stream);
+            response.Content.Headers.Add(HttpHeaderNames.ContentType, "application/http;msgtype=response");
+            TraceWriter.WriteLine("before ReadAsHttpResponseMessageAsync",
+                    TraceLevel.Verbose);
+            var responseMessage = await response.Content.ReadAsHttpResponseMessageAsync().ConfigureAwait(false);
+            if (responseMessage.Content != null && _bufferContent)
+                await responseMessage.Content.LoadIntoBufferAsync().ConfigureAwait(false); 
+            return responseMessage;
+        }
 
-			}
-
-		}
-
-		public Task<HttpResponseMessage> DeserializeToResponseAsync(Stream stream)
-		{
-			var response = new HttpResponseMessage();
-			response.Content = new StreamContent(stream);
-			response.Content.Headers.Add("Content-Type", "application/http;msgtype=response");
-			TraceWriter.WriteLine("before ReadAsHttpResponseMessageAsync",
-					TraceLevel.Verbose);
-			return response.Content.ReadAsHttpResponseMessageAsync();
-		}
-
-		public Task<HttpRequestMessage> DeserializeToRequestAsync(Stream stream)
-		{
-			var request = new HttpRequestMessage();
-			request.Content = new StreamContent(stream);
-			request.Content.Headers.Add("Content-Type", "application/http;msgtype=request");
-			return request.Content.ReadAsHttpRequestMessageAsync();
-		}
-	}
+        public async Task<HttpRequestMessage> DeserializeToRequestAsync(Stream stream)
+        {
+            var request = new HttpRequestMessage();
+            request.Content = new StreamContent(stream);
+            request.Content.Headers.Add(HttpHeaderNames.ContentType, "application/http;msgtype=request");
+            var requestMessage = await request.Content.ReadAsHttpRequestMessageAsync().ConfigureAwait(false);
+            if (requestMessage.Content != null && _bufferContent)
+                await requestMessage.Content.LoadIntoBufferAsync().ConfigureAwait(false);
+            return requestMessage;
+        }
+    }
 }

@@ -12,9 +12,13 @@ namespace CacheCow.Client.Headers
 		public static CacheCowHeader GetCacheCowHeader(this HttpResponseHeaders headers)
 		{
 			CacheCowHeader header = null;
-			var cacheCowHeader = headers.Where(x => x.Key == CacheCowHeader.Name).FirstOrDefault();
 
-			if(cacheCowHeader.Value.Count() > 0)
+		    if (headers == null)
+		        return null;
+
+            var cacheCowHeader = headers.FirstOrDefault(x => x.Key == CacheCowHeader.Name);
+
+			if(cacheCowHeader.Value != null && cacheCowHeader.Value.Count() > 0)
 			{
 				var last = cacheCowHeader.Value.Last();
 				CacheCowHeader.TryParse(last, out header);

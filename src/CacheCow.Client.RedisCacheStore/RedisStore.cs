@@ -2,6 +2,7 @@
 using System.Collections.Generic;
 using System.Configuration;
 using System.Data.Common;
+using System.Diagnostics;
 using System.IO;
 using System.Linq;
 using System.Net.Http;
@@ -24,83 +25,158 @@ namespace CacheCow.Client.RedisCacheStore
         private IDatabase _database;
 		private bool _dispose;
 		private MessageContentHttpMessageSerializer _serializer = new MessageContentHttpMessageSerializer();
+	    private bool _throwExceptions;
+        private static TimeSpan DefaultMinLifeTime = TimeSpan.FromHours(6);
 
-         public RedisStore(string connectionString, 
-            int databaseId = 0)
-        {
-            Init(ConnectionMultiplexer.Connect(connectionString), databaseId);
-        }
+	    public RedisStore(string connectionString, 
+            int databaseId = 0,
+            bool throwExceptions = true)
+	    {
+	        _throwExceptions = throwExceptions;
+	        try
+	        {
+                Init(ConnectionMultiplexer.Connect(connectionString),
+                    databaseId, throwExceptions);
+            }
+	        catch (Exception e)
+	        {
+                if(_throwExceptions)
+	                throw;
+                else
+                    Trace.WriteLine(e.ToString());
+	        }	        
+	    }
 
         public RedisStore(ConnectionMultiplexer connection, 
-            int databaseId = 0)
+            int databaseId = 0,
+            bool throwExceptions = true)
         {
-            Init(connection, databaseId);
+            Init(connection, databaseId, throwExceptions);
         }
 
-        public RedisStore(IDatabase database)
+        public RedisStore(IDatabase database,
+            bool throwExceptions = true)
         {
             _database = database;
+            _throwExceptions = throwExceptions;
         }
 
-        private void Init(ConnectionMultiplexer connection, int databaseId = 0)
+        private void Init(ConnectionMultiplexer connection, 
+            int databaseId = 0,
+            bool throwExceptions = true)
         {
             _connection = connection;
             _database = _connection.GetDatabase(databaseId);
+            _throwExceptions = throwExceptions;
         }
-		
 
-		/// <summary>
-		/// Gets the value if exists
-		/// ------------------------------------------
-		/// 
-		/// Steps:
-		/// 
-		/// 1) Get the value
-		/// 2) Update domain-based earliest access
-		/// 3) Update global earliest access
-		/// </summary>
-		/// <param name="key"></param>
-		/// <param name="response"></param>
-		/// <returns></returns>
-		public bool TryGetValue(CacheKey key, out HttpResponseMessage response)
-		{
-			HttpResponseMessage result = null;
-			response = null;
-			string entryKey = key.Hash.ToBase64();
-            
-			if (!_database.KeyExists(entryKey))
-				return false;
-
-			byte[] value = _database.StringGet(entryKey);
-			
-			var memoryStream = new MemoryStream(value);
-            response = Task.Factory.StartNew(() => _serializer.DeserializeToResponseAsync(memoryStream).Result).Result; // offloading
-		    return true;
-		}
-
-		public void AddOrUpdate(CacheKey key, HttpResponseMessage response)
-		{
-			var memoryStream = new MemoryStream();
-		    Task.Factory.StartNew(() => _serializer.SerializeAsync(response.ToTask(), memoryStream).Wait()).Wait(); // offloading
-		    memoryStream.Position = 0;
-		    var data = memoryStream.ToArray();
-		    _database.StringSet(key.HashBase64, data);
-		}
-
-        public bool TryRemove(CacheKey key)
+        /// <summary>
+        /// Minimum expiry of items. Default is 6 hours.
+        /// Bear in mind, even expired items can be used if we do a cache validation request and get back 304
+        /// </summary>
+        public TimeSpan MinExpiry
         {
-            return _database.KeyDelete(key.HashBase64);
+            get; set;
         }
 
-        public void Clear()
-		{
-			throw new NotSupportedException("Currently not supported by StackExchange.Redis. Use redis-cli.exe"); 
-		}
-
-		public void Dispose()
+        public void Dispose()
 		{
 			if (_connection != null && _dispose)
 				_connection.Dispose();
 		}
+
+        // has to have async for the purpose of exception handling
+        public async Task<HttpResponseMessage> GetValueAsync(CacheKey key)
+        {
+            try
+            {
+                return await DoGetValueAsync(key).ConfigureAwait(false);
+            }
+            catch (Exception e)
+            {
+                if (_throwExceptions)
+                    throw;
+                else
+                    Trace.WriteLine(e.ToString());
+                return null;
+            }
+        }
+
+	    private async Task<HttpResponseMessage> DoGetValueAsync(CacheKey key)
+	    {
+            HttpResponseMessage result = null;
+            string entryKey = key.HashBase64;
+
+            if (!await _database.KeyExistsAsync(entryKey).ConfigureAwait(false))
+                return null;
+
+            byte[] value = await _database.StringGetAsync(entryKey).ConfigureAwait(false);
+            var memoryStream = new MemoryStream(value);
+            var r = await _serializer.DeserializeToResponseAsync(memoryStream).ConfigureAwait(false);
+
+            return r;
+        }
+
+        // has to have async for the purpose of exception handling
+        public async Task AddOrUpdateAsync(CacheKey key, HttpResponseMessage response)
+        {
+            try
+            {
+                await DoAddOrUpdateAsync(key, response).ConfigureAwait(false);
+            }
+            catch(Exception e)
+            {
+                if (_throwExceptions)
+                    throw;
+                else
+                    Trace.WriteLine(e.ToString());
+            }
+        }
+
+	    private async Task<bool> DoAddOrUpdateAsync(CacheKey key, HttpResponseMessage response)
+	    {
+            var memoryStream = new MemoryStream();
+            await _serializer.SerializeAsync(response, memoryStream).ConfigureAwait(false);
+            memoryStream.Position = 0;
+            var data = memoryStream.ToArray();
+            var expiry = response.GetExpiry() ?? DateTimeOffset.UtcNow.AddDays(1);
+            var minExpiry = DateTimeOffset.UtcNow.Add(DefaultMinLifeTime);
+            if (expiry <= minExpiry)
+            {
+                // NOTE: Eventhough the expiry might be now or maxage=0, there is still
+                // benefit in storing so you can do conditional get after expiry
+                expiry = minExpiry;
+            }
+
+            await _database.StringSetAsync(key.HashBase64, data, expiry.Subtract(DateTimeOffset.UtcNow)).ConfigureAwait(false);
+            return true;
+        }
+
+        // has to have async for the purpose of exception handling
+        public async Task<bool> TryRemoveAsync(CacheKey key)
+        {
+            try
+            {
+                return await DoTryRemoveAsync(key).ConfigureAwait(false);
+            }
+            catch (Exception e)
+            {
+                if (_throwExceptions)
+                    throw;
+                else
+                    Trace.WriteLine(e.ToString());
+                return false;
+            }
+        }
+
+        private Task<bool> DoTryRemoveAsync(CacheKey key)
+        {
+            return _database.KeyDeleteAsync(key.HashBase64);
+        }
+
+        public Task ClearAsync()
+        {
+            throw new NotSupportedException("Currently not supported by StackExchange.Redis. Use redis-cli.exe"); 
+        }
 	}
 }
